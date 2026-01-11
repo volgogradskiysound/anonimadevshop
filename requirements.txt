@@ -1,0 +1,4 @@
+aiocryptopay
+aiogram
+asyncio
+sqlite3
