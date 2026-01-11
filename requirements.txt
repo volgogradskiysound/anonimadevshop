@@ -1,4 +1,4 @@
-aiocryptopay
-aiogram
-asyncio
-sqlite3
+aiocryptopay==0.4.8
+aiogram==3.24.0
+asyncio==4.0.0
+sqlite3==3.51.1
