@@ -218,6 +218,23 @@ async def send_media_message(message: Message, text: str, reply_markup=None, sec
         logger.error(f"Error sending media: {e}")
         await message.answer(text, reply_markup=reply_markup)
 
+async def send_media_to_user(user_id: int, text: str, section=None):
+    """Отправка сообщения конкретному юзеру (по ID) с медиа"""
+    media_type, media_file_id = get_media(section) if section else (None, None)
+    
+    try:
+        if media_type == 'photo':
+            await bot.send_photo(user_id, media_file_id, caption=text)
+        elif media_type == 'animation':
+            await bot.send_animation(user_id, media_file_id, caption=text)
+        elif media_type == 'video':
+            await bot.send_video(user_id, media_file_id, caption=text)
+        else:
+            await bot.send_message(user_id, text)
+    except Exception as e:
+        logger.error(f"Error sending media to user: {e}")
+        await bot.send_message(user_id, text)
+
 # ==================== СТАРТ И МЕНЮ ====================
 @router.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
@@ -299,6 +316,8 @@ async def user_show_products(call: CallbackQuery):
     cat_id = call.data.split('_')[1]
     with get_db() as conn:
         prods = conn.execute("SELECT id, name, price FROM products WHERE category_id = ?", (cat_id,)).fetchall()
+        # Получаем инфо о категории, включая медиа
+        cat = conn.execute("SELECT name, description, media_type, media_file_id FROM categories WHERE id = ?", (cat_id,)).fetchone()
     
     if not prods:
         await call.answer("В этой категории пока пусто 😔", show_alert=True)
@@ -309,7 +328,26 @@ async def user_show_products(call: CallbackQuery):
         kb.append([InlineKeyboardButton(text=f"{p[1]} — {p[2]} RUB", callback_data=f"prod_{p[0]}")])
     kb.append([InlineKeyboardButton(text="🔙 К категориям", callback_data="back_to_cats")])
     
-    await call.message.edit_text("📦 <b>Выберите товар:</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    text_header = f"📂 <b>{cat[0]}</b>\n\n{cat[1] if cat[1] else ''}\n\n📦 <b>Выберите товар:</b>"
+    
+    await call.message.delete()
+    
+    markup = InlineKeyboardMarkup(inline_keyboard=kb)
+    
+    if cat[2] and cat[3]:
+        try:
+            if cat[2] == 'photo':
+                await call.message.answer_photo(cat[3], caption=text_header, reply_markup=markup)
+            elif cat[2] == 'video':
+                await call.message.answer_video(cat[3], caption=text_header, reply_markup=markup)
+            elif cat[2] == 'animation':
+                await call.message.answer_animation(cat[3], caption=text_header, reply_markup=markup)
+            else:
+                 await call.message.answer(text_header, reply_markup=markup)
+        except:
+             await call.message.answer(text_header, reply_markup=markup)
+    else:
+        await call.message.answer(text_header, reply_markup=markup)
 
 @router.callback_query(F.data == "back_to_cats")
 async def back_to_cats(call: CallbackQuery):
@@ -335,16 +373,19 @@ async def user_prod_info(call: CallbackQuery):
     ])
     
     if prod[7] and prod[8]: # Если есть медиа
-        # Приходится удалять и слать заново, так как нельзя из текста сделать фото
         await call.message.delete()
-        if prod[7] == 'photo':
-            await bot.send_photo(call.from_user.id, prod[8], caption=text, reply_markup=kb)
-        elif prod[7] == 'video':
-            await bot.send_video(call.from_user.id, prod[8], caption=text, reply_markup=kb)
-        elif prod[7] == 'animation':
-            await bot.send_animation(call.from_user.id, prod[8], caption=text, reply_markup=kb)
+        try:
+            if prod[7] == 'photo':
+                await bot.send_photo(call.from_user.id, prod[8], caption=text, reply_markup=kb)
+            elif prod[7] == 'video':
+                await bot.send_video(call.from_user.id, prod[8], caption=text, reply_markup=kb)
+            elif prod[7] == 'animation':
+                await bot.send_animation(call.from_user.id, prod[8], caption=text, reply_markup=kb)
+        except:
+            await bot.send_message(call.from_user.id, text, reply_markup=kb)
     else:
-        await call.message.edit_text(text, reply_markup=kb)
+        await call.message.delete()
+        await bot.send_message(call.from_user.id, text, reply_markup=kb)
 
 @router.callback_query(F.data.startswith('buy_'))
 async def user_buy(call: CallbackQuery):
@@ -363,7 +404,6 @@ async def user_buy(call: CallbackQuery):
             await call.answer(f"❌ Не хватает средств!\nБаланс: {user[0]} RUB\nЦена: {prod[4]} RUB", show_alert=True)
             return
         
-        # Списание и выдача
         new_bal = user[0] - prod[4]
         conn.execute("UPDATE users SET balance = ? WHERE user_id = ?", (new_bal, user_id))
         conn.execute("UPDATE products SET stock = stock - 1 WHERE id = ?", (prod_id,))
@@ -371,7 +411,6 @@ async def user_buy(call: CallbackQuery):
                     (user_id, prod_id, prod[4], datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
         conn.commit()
     
-    # Отправка товара
     success_msg = f"✅ <b>Покупка успешна!</b>\n\nСписано: {prod[4]} RUB\nОстаток: {new_bal} RUB\n\n👇 <b>Ваш товар:</b>"
     
     if prod[5] == 'text':
@@ -380,7 +419,6 @@ async def user_buy(call: CallbackQuery):
         await call.message.answer(success_msg)
         await call.message.answer_document(prod[6])
         
-    # Уведомление админам
     if get_setting('notify_purchases') == '1':
         for admin in ADMINS:
             try: await bot.send_message(admin, f"💰 <b>Новая продажа!</b>\nТовар: {prod[2]}\nСумма: {prod[4]} RUB\nПокупатель: {user_id}")
@@ -416,7 +454,7 @@ async def user_support(message: Message):
 @router.callback_query(F.data == "add_money")
 async def pay_start(call: CallbackQuery, state: FSMContext):
     await state.set_state(UserState.replenish_amount)
-    await call.message.answer("💸 <b>Введите сумму пополнения в РУБЛЯХ:</b>", reply_markup=cancel_kb())
+    await send_media_message(call.message, "💸 <b>Введите сумму пополнения в РУБЛЯХ:</b>", cancel_kb(), 'replenish')
 
 @router.message(UserState.replenish_amount)
 async def pay_amount(message: Message, state: FSMContext):
@@ -437,8 +475,6 @@ async def pay_amount(message: Message, state: FSMContext):
 async def pay_crypto(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     amount_rub = data['amount']
-    # Простой конвертер для примера (лучше использовать API)
-    # Примерно 100 руб = 1 USDT
     amount_usdt = round(amount_rub / 98, 2) 
     
     try:
@@ -496,17 +532,21 @@ async def check_crypto(call: CallbackQuery):
                 conn.execute("UPDATE payments SET status='paid' WHERE invoice_id=?", (inv_id,))
                 conn.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (pay[1], call.from_user.id))
                 conn.commit()
-                await call.message.edit_text("✅ <b>Оплата прошла! Баланс пополнен.</b>")
+                
+                await call.message.delete()
+                await send_media_to_user(call.from_user.id, "✅ <b>Оплата прошла! Баланс пополнен.</b>", 'replenish_success')
                 return
     await call.answer("⏳ Оплата пока не найдена", show_alert=True)
 
 @router.callback_query(F.data.startswith('ap_'))
 async def admin_pay_ok(call: CallbackQuery):
     _, uid, amt = call.data.split('_')
+    uid = int(uid)
     with get_db() as conn:
         conn.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (float(amt), uid))
         conn.commit()
-    await bot.send_message(uid, f"✅ <b>Ваш баланс пополнен на {amt} RUB!</b>")
+    
+    await send_media_to_user(uid, f"✅ <b>Ваш баланс пополнен на {amt} RUB!</b>", 'replenish_success')
     await call.message.edit_text(f"✅ Одобрено ({amt} RUB)")
 
 @router.callback_query(F.data.startswith('dp_'))
@@ -541,10 +581,25 @@ async def adm_cat_name(message: Message, state: FSMContext):
     await message.answer("📝 Введите описание категории:")
 
 @router.message(AdminState.cat_desc)
+async def adm_cat_desc_ask_media(message: Message, state: FSMContext):
+    await state.update_data(desc=message.text)
+    await state.set_state(AdminState.cat_media)
+    await message.answer("📸 Пришлите фото/видео для обложки категории (или напишите 'нет'):")
+
+@router.message(AdminState.cat_media)
 async def adm_cat_save(message: Message, state: FSMContext):
+    m_type, m_id = None, None
+    if message.photo:
+        m_type, m_id = 'photo', message.photo[-1].file_id
+    elif message.video:
+        m_type, m_id = 'video', message.video.file_id
+    elif message.animation:
+        m_type, m_id = 'animation', message.animation.file_id
+        
     data = await state.get_data()
     with get_db() as conn:
-        conn.execute("INSERT INTO categories (name, description) VALUES (?, ?)", (data['name'], message.text))
+        conn.execute("INSERT INTO categories (name, description, media_type, media_file_id) VALUES (?, ?, ?, ?)", 
+                     (data['name'], data['desc'], m_type, m_id))
         conn.commit()
     await state.clear()
     await message.answer("✅ Категория добавлена!", reply_markup=admin_keyboard())
@@ -702,7 +757,10 @@ async def adm_bal_final(message: Message, state: FSMContext):
         with get_db() as conn:
             conn.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amt, d['uid']))
             conn.commit()
-        await bot.send_message(d['uid'], f"⚡️ <b>Ваш баланс изменен:</b> {amt:+} RUB")
+        
+        # УВЕДОМЛЕНИЕ С МЕДИА (От админа)
+        await send_media_to_user(d['uid'], f"⚡️ <b>Ваш баланс изменен:</b> {amt:+} RUB", 'admin_replenish')
+        
         await message.answer("✅ Успешно", reply_markup=admin_keyboard())
         await state.clear()
     except: await message.answer("Ошибка")
@@ -756,20 +814,89 @@ async def adm_mail_stop(call: CallbackQuery, state: FSMContext):
 async def adm_media_menu(message: Message):
     if message.from_user.id not in ADMINS: return
     
-    # Клавиатура со всеми разделами
+    # Клавиатура
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🏠 Приветствие", callback_data="med_welcome")],
         [InlineKeyboardButton(text="🛍 Каталог", callback_data="med_catalog")],
         [InlineKeyboardButton(text="👤 Профиль", callback_data="med_profile")],
         [InlineKeyboardButton(text="ℹ️ О нас", callback_data="med_about")],
-        [InlineKeyboardButton(text="👨‍💻 Поддержка", callback_data="med_support")]
+        [InlineKeyboardButton(text="👨‍💻 Поддержка", callback_data="med_support")],
+        [InlineKeyboardButton(text="💰 Пополнение", callback_data="med_replenish")],
+        [InlineKeyboardButton(text="✅ Успех пополнения", callback_data="med_replenish_success")],
+        # НОВЫЕ КНОПКИ
+        [InlineKeyboardButton(text="🎁 Пополнение Админом", callback_data="med_admin_replenish")],
+        [InlineKeyboardButton(text="📂 Медиа Категории", callback_data="edit_med_cat")],
+        [InlineKeyboardButton(text="📦 Медиа Товара", callback_data="edit_med_prod")],
     ])
     await message.answer("🖼 <b>Управление Медиа</b>\nВыберите раздел:", reply_markup=kb)
+
+# --- ЛОГИКА МЕДИА КАТЕГОРИЙ И ТОВАРОВ ---
+
+# Выбор категории для редактирования медиа
+@router.callback_query(F.data == "edit_med_cat")
+async def adm_med_cat_list(call: CallbackQuery):
+    with get_db() as conn:
+        cats = conn.execute("SELECT id, name FROM categories").fetchall()
+    if not cats:
+        await call.answer("Нет категорий")
+        return
+    kb = []
+    for c in cats:
+        kb.append([InlineKeyboardButton(text=c[1], callback_data=f"set_med_cat_{c[0]}")])
+    kb.append([InlineKeyboardButton(text="🔙 Назад", callback_data="back_media")])
+    await call.message.edit_text("📂 Выберите категорию для смены обложки:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+
+# Выбор категории для редактирования медиа товара
+@router.callback_query(F.data == "edit_med_prod")
+async def adm_med_prod_cat_list(call: CallbackQuery):
+    with get_db() as conn:
+        cats = conn.execute("SELECT id, name FROM categories").fetchall()
+    if not cats:
+        await call.answer("Нет категорий")
+        return
+    kb = []
+    for c in cats:
+        kb.append([InlineKeyboardButton(text=c[1], callback_data=f"pick_prod_cat_{c[0]}")])
+    kb.append([InlineKeyboardButton(text="🔙 Назад", callback_data="back_media")])
+    await call.message.edit_text("📂 Выберите категорию товара:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+
+# Выбор товара
+@router.callback_query(F.data.startswith("pick_prod_cat_"))
+async def adm_med_prod_list(call: CallbackQuery):
+    cat_id = call.data.split('_')[3]
+    with get_db() as conn:
+        prods = conn.execute("SELECT id, name FROM products WHERE category_id = ?", (cat_id,)).fetchall()
+    if not prods:
+        await call.answer("В категории нет товаров", show_alert=True)
+        return
+    kb = []
+    for p in prods:
+        kb.append([InlineKeyboardButton(text=p[1], callback_data=f"set_med_prod_{p[0]}")])
+    kb.append([InlineKeyboardButton(text="🔙 Назад", callback_data="edit_med_prod")])
+    await call.message.edit_text("📦 Выберите товар для смены медиа:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+
+# Установка медиа для категории
+@router.callback_query(F.data.startswith("set_med_cat_"))
+async def adm_ask_med_cat(call: CallbackQuery, state: FSMContext):
+    cat_id = call.data.split('_')[3]
+    await state.update_data(target='category', target_id=cat_id)
+    await state.set_state(AdminState.media_upload)
+    await call.message.edit_text("📸 Отправьте новое фото/видео/гиф для КАТЕГОРИИ:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Отмена", callback_data="back_media")]]))
+
+# Установка медиа для товара
+@router.callback_query(F.data.startswith("set_med_prod_"))
+async def adm_ask_med_prod(call: CallbackQuery, state: FSMContext):
+    prod_id = call.data.split('_')[3]
+    await state.update_data(target='product', target_id=prod_id)
+    await state.set_state(AdminState.media_upload)
+    await call.message.edit_text("📸 Отправьте новое фото/видео/гиф для ТОВАРА:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Отмена", callback_data="back_media")]]))
+
 
 @router.callback_query(F.data.startswith('med_'))
 async def adm_media_sel(call: CallbackQuery, state: FSMContext):
     sect = call.data.split('_')[1]
-    await state.update_data(sect=sect)
+    # Если это общие настройки (welcome, replenish, etc)
+    await state.update_data(target='setting', sect=sect)
     await state.set_state(AdminState.media_upload)
     
     curr = get_media(sect)
@@ -800,13 +927,26 @@ async def adm_media_save(message: Message, state: FSMContext):
         return
         
     d = await state.get_data()
+    target = d.get('target')
+    
     with get_db() as conn:
-        conn.execute("INSERT OR REPLACE INTO media_settings (section, media_type, media_file_id) VALUES (?,?,?)",
-                    (d['sect'], m_type, m_id))
+        if target == 'setting':
+            conn.execute("INSERT OR REPLACE INTO media_settings (section, media_type, media_file_id) VALUES (?,?,?)",
+                        (d['sect'], m_type, m_id))
+            msg = "✅ Медиа раздела обновлено!"
+            
+        elif target == 'category':
+            conn.execute("UPDATE categories SET media_type=?, media_file_id=? WHERE id=?", (m_type, m_id, d['target_id']))
+            msg = "✅ Обложка категории обновлена!"
+            
+        elif target == 'product':
+            conn.execute("UPDATE products SET media_type=?, media_file_id=? WHERE id=?", (m_type, m_id, d['target_id']))
+            msg = "✅ Медиа товара обновлено!"
+            
         conn.commit()
     
     await state.clear()
-    await message.answer("✅ Медиа обновлено!", reply_markup=admin_keyboard())
+    await message.answer(msg, reply_markup=admin_keyboard())
 
 @router.callback_query(F.data.startswith('delmed_'))
 async def adm_del_med(call: CallbackQuery):
